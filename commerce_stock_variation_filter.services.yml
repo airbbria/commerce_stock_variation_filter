@@ -1,0 +1,14 @@
+services:
+  # Stock helper service providing utility methods for variation stock checks.
+  # Centralized logic ensures consistency across hooks and widgets.
+  commerce_stock_variation_filter.stock_helper:
+    class: Drupal\commerce_stock_variation_filter\Service\StockHelper
+    arguments: ['@entity_type.manager']
+
+  # Event subscriber for AJAX-safe handling of variation changes.
+  # Ensures stock filtering persists through AJAX attribute selection updates.
+  commerce_stock_variation_filter.ajax_subscriber:
+    class: Drupal\commerce_stock_variation_filter\EventSubscriber\ProductVariationAjaxSubscriber
+    arguments: ['@commerce_stock_variation_filter.stock_helper']
+    tags:
+      - { name: event_subscriber }

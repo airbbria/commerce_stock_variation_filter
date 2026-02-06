@@ -1,0 +1,56 @@
+<?php
+
+/**
+ * @file
+ * Install, update, and uninstall functions for Commerce Stock Variation Filter.
+ */
+
+/**
+ * Implements hook_requirements().
+ *
+ * Verifies that the field_stock field exists on product variations.
+ */
+function commerce_stock_variation_filter_requirements($phase) {
+  $requirements = [];
+
+  if ($phase === 'runtime') {
+    // Check if field_stock exists on any variation type.
+    $field_storage = \Drupal::entityTypeManager()
+      ->getStorage('field_storage_config')
+      ->load('commerce_product_variation.field_stock');
+
+    if (!$field_storage) {
+      $requirements['commerce_stock_variation_filter_field'] = [
+        'title' => t('Commerce Stock Variation Filter'),
+        'value' => t('Missing field_stock'),
+        'description' => t('The Commerce Stock Variation Filter module requires a "field_stock" integer field on product variation entities. Please create this field or the module will not function correctly.'),
+        'severity' => REQUIREMENT_WARNING,
+      ];
+    }
+    else {
+      $requirements['commerce_stock_variation_filter_field'] = [
+        'title' => t('Commerce Stock Variation Filter'),
+        'value' => t('field_stock field configured'),
+        'severity' => REQUIREMENT_OK,
+      ];
+    }
+  }
+
+  return $requirements;
+}
+
+/**
+ * Implements hook_install().
+ */
+function commerce_stock_variation_filter_install() {
+  // Log installation.
+  \Drupal::logger('commerce_stock_variation_filter')->notice('Commerce Stock Variation Filter module installed. Ensure field_stock exists on product variations.');
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function commerce_stock_variation_filter_uninstall() {
+  // Clean up any module-specific cache tags.
+  \Drupal::cache()->invalidateTags(['commerce_stock_variation_filter']);
+}

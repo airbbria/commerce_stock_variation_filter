@@ -1,0 +1,379 @@
+<?php
+
+/**
+ * @file
+ * Commerce Stock Variation Filter module.
+ *
+ * Extends the Commerce Add to Cart form to intelligently handle stock:
+ * - Selects first in-stock variation as default on initial page load.
+ * - Marks out-of-stock attribute options as disabled but visible.
+ * - Hides the entire form when all variations are out of stock.
+ *
+ * Architecture decisions:
+ * - Uses hook_form_alter for Add to Cart form modifications.
+ * - Leverages form_state to track initial load vs AJAX interactions.
+ * - Integrates with Commerce's AJAX system via event subscriber.
+ * - Custom widget extends core attributes widget for stock awareness.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\commerce_product\Entity\ProductInterface;
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for commerce_order_item_add_to_cart_form.
+ *
+ * This hook intercepts the Add to Cart form before rendering to:
+ * 1. Check if all variations are out of stock (show "Out of stock" message).
+ * 2. Set the default selected variation to the first in-stock variation.
+ * 3. Attach stock data for AJAX-safe attribute option disabling.
+ *
+ * Why form_alter instead of custom form class:
+ * - Maintains compatibility with other contrib modules.
+ * - Doesn't override Commerce's internal form handling.
+ * - Works with Commerce's AJAX variation selection system.
+ */
+function commerce_stock_variation_filter_form_commerce_order_item_add_to_cart_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  /** @var \Drupal\commerce_stock_variation_filter\Service\StockHelper $stock_helper */
+  $stock_helper = \Drupal::service('commerce_stock_variation_filter.stock_helper');
+
+  // Get the product from form state (set by Commerce's AddToCartForm).
+  /** @var \Drupal\commerce_product\Entity\ProductInterface|null $product */
+  $product = $form_state->get('product');
+  if (!$product instanceof ProductInterface) {
+    return;
+  }
+
+  // Load all enabled variations for this product.
+  /** @var \Drupal\commerce_product\ProductVariationStorageInterface $variation_storage */
+  $variation_storage = \Drupal::entityTypeManager()->getStorage('commerce_product_variation');
+  $variations = $variation_storage->loadEnabled($product);
+
+  if (empty($variations)) {
+    _commerce_stock_variation_filter_render_out_of_stock($form);
+    return;
+  }
+
+  // Build stock map: variation_id => is_in_stock (boolean).
+  $stock_map = $stock_helper->buildStockMap($variations);
+
+  // Check if ALL variations are out of stock.
+  $has_any_in_stock = in_array(TRUE, $stock_map, TRUE);
+
+  if (!$has_any_in_stock) {
+    // All variations out of stock: render only "Out of stock" message.
+    _commerce_stock_variation_filter_render_out_of_stock($form);
+    return;
+  }
+
+  // Determine if this is the initial page load (not an AJAX callback).
+  // We only override the default variation on initial load, not on user interaction.
+  $is_initial_load = !$form_state->get('commerce_stock_filter_ajax_processed');
+
+  if ($is_initial_load) {
+    // Find first in-stock variation and set as default.
+    $first_in_stock = $stock_helper->getFirstInStockVariation($variations);
+
+    if ($first_in_stock) {
+      // Store the selected variation in form_state for widget processing.
+      // This triggers Commerce to use this variation as the default.
+      $form_state->set('selected_variation', $first_in_stock->id());
+
+      // Also update the purchased_entity default value if the widget exists.
+      if (isset($form['purchased_entity']['widget'][0]['variation']['#default_value'])) {
+        $form['purchased_entity']['widget'][0]['variation']['#default_value'] = $first_in_stock->id();
+      }
+    }
+  }
+
+  // Attach stock data to form for JavaScript/widget processing.
+  // This allows attribute widgets to mark options as disabled.
+  $form['#attached']['drupalSettings']['commerceStockVariationFilter'] = [
+    'stockMap' => $stock_map,
+    'formId' => $form_id,
+  ];
+
+  // Attach library for JavaScript processing.
+  $form['#attached']['library'][] = 'commerce_stock_variation_filter/stock_filter';
+
+  // Store stock map in form_state for widget access.
+  $form_state->set('commerce_stock_variation_filter_stock_map', $stock_map);
+  $form_state->set('commerce_stock_variation_filter_variations', $variations);
+
+  // Process attribute widgets to disable out-of-stock options.
+  if (isset($form['purchased_entity']['widget'][0]['attributes'])) {
+    _commerce_stock_variation_filter_process_attributes(
+      $form['purchased_entity']['widget'][0]['attributes'],
+      $variations,
+      $stock_map,
+      $form_state
+    );
+  }
+}
+
+/**
+ * Renders the "Out of stock" message and hides the Add to Cart form elements.
+ *
+ * @param array $form
+ *   The form array to modify.
+ */
+function _commerce_stock_variation_filter_render_out_of_stock(array &$form) {
+  // Hide the purchased entity selector (variation attributes).
+  if (isset($form['purchased_entity'])) {
+    $form['purchased_entity']['#access'] = FALSE;
+  }
+
+  // Hide quantity field if present.
+  if (isset($form['quantity'])) {
+    $form['quantity']['#access'] = FALSE;
+  }
+
+  // Hide the Add to Cart button.
+  if (isset($form['actions']['submit'])) {
+    $form['actions']['submit']['#access'] = FALSE;
+  }
+
+  // Add prominent "Out of stock" message.
+  $form['out_of_stock_message'] = [
+    '#type' => 'html_tag',
+    '#tag' => 'div',
+    '#value' => t('Out of stock'),
+    '#attributes' => [
+      'class' => [
+        'commerce-stock-variation-filter--out-of-stock',
+        'messages',
+        'messages--warning',
+      ],
+    ],
+    '#weight' => -100,
+  ];
+}
+
+/**
+ * Processes attribute form elements to disable out-of-stock options.
+ *
+ * This function iterates through all attribute widgets and marks options
+ * that belong ONLY to out-of-stock variations as disabled. Options that
+ * exist in at least one in-stock variation remain enabled.
+ *
+ * IMPORTANT: For radios and rendered attributes, we use #after_build because
+ * individual option elements don't exist until Drupal processes the element.
+ * This is why initial load differs from AJAX - #after_build ensures we modify
+ * elements AFTER they're fully built.
+ *
+ * @param array $attributes
+ *   The attributes form element array (by reference).
+ * @param \Drupal\commerce_product\Entity\ProductVariationInterface[] $variations
+ *   Array of product variation entities.
+ * @param array $stock_map
+ *   Variation ID => is_in_stock boolean map.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The form state object.
+ */
+function _commerce_stock_variation_filter_process_attributes(array &$attributes, array $variations, array $stock_map, FormStateInterface $form_state) {
+  /** @var \Drupal\commerce_stock_variation_filter\Service\StockHelper $stock_helper */
+  $stock_helper = \Drupal::service('commerce_stock_variation_filter.stock_helper');
+
+  // Build a map of attribute_field_name => attribute_value_id => [variation_ids].
+  $attribute_variation_map = $stock_helper->buildAttributeVariationMap($variations);
+
+  // Iterate through each attribute widget element.
+  foreach ($attributes as $attribute_field_name => &$attribute_element) {
+    // Skip non-attribute elements (those starting with #).
+    if (strpos($attribute_field_name, '#') === 0) {
+      continue;
+    }
+
+    // Skip if not a form element array.
+    if (!is_array($attribute_element)) {
+      continue;
+    }
+
+    // Get the element type to determine how to disable options.
+    $element_type = $attribute_element['#type'] ?? NULL;
+
+    if (!$element_type) {
+      continue;
+    }
+
+    // Get attribute value to variation mapping for this attribute.
+    $value_variation_map = $attribute_variation_map[$attribute_field_name] ?? [];
+
+    // Determine which attribute values have NO in-stock variations.
+    $disabled_values = [];
+    foreach ($value_variation_map as $attribute_value_id => $variation_ids) {
+      $has_in_stock = FALSE;
+      foreach ($variation_ids as $variation_id) {
+        if (!empty($stock_map[$variation_id])) {
+          $has_in_stock = TRUE;
+          break;
+        }
+      }
+      if (!$has_in_stock) {
+        $disabled_values[$attribute_value_id] = TRUE;
+      }
+    }
+
+    // Store disabled values for #after_build processing and JavaScript.
+    $attribute_element['#commerce_stock_disabled_values'] = array_keys($disabled_values);
+    $attribute_element['#attributes']['data-stock-disabled'] = json_encode(array_keys($disabled_values));
+
+    // Apply disabling based on element type.
+    switch ($element_type) {
+      case 'select':
+        // For select elements, modify option labels directly.
+        // Options exist at this point for selects.
+        if (isset($attribute_element['#options'])) {
+          foreach ($attribute_element['#options'] as $option_value => &$option_label) {
+            if (isset($disabled_values[$option_value])) {
+              // Append "(Out of stock)" to label.
+              $option_label = $option_label . ' ' . t('(Out of stock)');
+            }
+          }
+        }
+        break;
+
+      case 'radios':
+        // For radio buttons, we MUST use #after_build because individual
+        // radio elements ($element[$value]) don't exist until the element
+        // is processed by Drupal's form rendering system.
+        $attribute_element['#after_build'][] = '_commerce_stock_variation_filter_after_build_radios';
+        break;
+
+      case 'commerce_product_rendered_attribute':
+        // For rendered attribute widgets (swatches), also use #after_build.
+        $attribute_element['#after_build'][] = '_commerce_stock_variation_filter_after_build_rendered';
+        break;
+    }
+
+    // Add general class for CSS targeting.
+    $attribute_element['#attributes']['class'][] = 'commerce-stock-variation-filter--processed';
+  }
+}
+
+/**
+ * #after_build callback for radio button attribute elements.
+ *
+ * This callback runs AFTER Drupal has expanded the radios element into
+ * individual radio button elements. At this point, $element[$value] exists
+ * for each option and we can properly disable them.
+ *
+ * @param array $element
+ *   The form element.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The form state.
+ *
+ * @return array
+ *   The modified form element.
+ */
+function _commerce_stock_variation_filter_after_build_radios(array $element, FormStateInterface $form_state): array {
+  $disabled_values = $element['#commerce_stock_disabled_values'] ?? [];
+
+  if (empty($disabled_values)) {
+    return $element;
+  }
+
+  foreach ($disabled_values as $disabled_value) {
+    // Now the individual radio elements exist and can be modified.
+    if (isset($element[$disabled_value])) {
+      // Set the #disabled property which Drupal uses to render disabled attribute.
+      $element[$disabled_value]['#disabled'] = TRUE;
+      // Also set the attribute directly for extra safety.
+      $element[$disabled_value]['#attributes']['disabled'] = 'disabled';
+      // Add form-item-disabled class to the wrapper div.
+      if (!isset($element[$disabled_value]['#wrapper_attributes']['class'])) {
+        $element[$disabled_value]['#wrapper_attributes']['class'] = [];
+      }
+      $element[$disabled_value]['#wrapper_attributes']['class'][] = 'form-item-disabled';
+    }
+  }
+
+  return $element;
+}
+
+/**
+ * #after_build callback for rendered attribute elements (swatches).
+ *
+ * Similar to radios, rendered attribute widgets need processing after
+ * their child elements are built.
+ *
+ * @param array $element
+ *   The form element.
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ *   The form state.
+ *
+ * @return array
+ *   The modified form element.
+ */
+function _commerce_stock_variation_filter_after_build_rendered(array $element, FormStateInterface $form_state): array {
+  $disabled_values = $element['#commerce_stock_disabled_values'] ?? [];
+
+  if (empty($disabled_values)) {
+    return $element;
+  }
+
+  foreach ($disabled_values as $disabled_value) {
+    if (isset($element[$disabled_value])) {
+      // Add form-item-disabled class to the wrapper div.
+      if (!isset($element[$disabled_value]['#wrapper_attributes']['class'])) {
+        $element[$disabled_value]['#wrapper_attributes']['class'] = [];
+      }
+      $element[$disabled_value]['#wrapper_attributes']['class'][] = 'form-item-disabled';
+    }
+  }
+
+  return $element;
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Marks AJAX-processed forms to prevent re-selecting the default variation
+ * on subsequent AJAX callbacks. This ensures user selection is preserved.
+ */
+function commerce_stock_variation_filter_form_alter(array &$form, FormStateInterface $form_state, $form_id) {
+  // Check if this is an Add to Cart form being processed via AJAX.
+  if (strpos($form_id, 'commerce_order_item_add_to_cart_form') !== FALSE) {
+    // Check for AJAX trigger element which indicates user interaction.
+    $triggering_element = $form_state->getTriggeringElement();
+    if ($triggering_element) {
+      // Mark as AJAX processed so we don't override user's selection.
+      $form_state->set('commerce_stock_filter_ajax_processed', TRUE);
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for commerce_product templates.
+ *
+ * Adds stock availability classes to the product wrapper for CSS targeting.
+ */
+function commerce_stock_variation_filter_preprocess_commerce_product(array &$variables) {
+  /** @var \Drupal\commerce_product\Entity\ProductInterface $product */
+  $product = $variables['product_entity'] ?? NULL;
+
+  if (!$product instanceof ProductInterface) {
+    return;
+  }
+
+  /** @var \Drupal\commerce_stock_variation_filter\Service\StockHelper $stock_helper */
+  $stock_helper = \Drupal::service('commerce_stock_variation_filter.stock_helper');
+
+  /** @var \Drupal\commerce_product\ProductVariationStorageInterface $variation_storage */
+  $variation_storage = \Drupal::entityTypeManager()->getStorage('commerce_product_variation');
+  $variations = $variation_storage->loadEnabled($product);
+
+  if (empty($variations)) {
+    $variables['attributes']['class'][] = 'commerce-stock-variation-filter--all-out-of-stock';
+    return;
+  }
+
+  $stock_map = $stock_helper->buildStockMap($variations);
+  $has_any_in_stock = in_array(TRUE, $stock_map, TRUE);
+
+  if (!$has_any_in_stock) {
+    $variables['attributes']['class'][] = 'commerce-stock-variation-filter--all-out-of-stock';
+  }
+  else {
+    $variables['attributes']['class'][] = 'commerce-stock-variation-filter--has-stock';
+  }
+}

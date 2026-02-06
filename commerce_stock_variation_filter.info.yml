@@ -1,0 +1,10 @@
+name: 'Commerce Stock Variation Filter'
+type: module
+description: 'Extends Commerce Add to Cart form to filter variations by stock availability. Selects first in-stock variation as default and marks out-of-stock attribute options as disabled.'
+package: Commerce (contrib)
+core_version_requirement: ^10
+dependencies:
+  - drupal:field
+  - commerce:commerce_product
+  - commerce:commerce_cart
+  - commerce:commerce_order
