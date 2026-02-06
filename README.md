@@ -35,6 +35,7 @@ The module expects a `field_stock` integer field on your product variation entit
    - Machine name: `field_stock`
    - Label: "Stock" (or your preference)
 4. Save the field
+5. Go to your order item type's "Manage form display" and change the "Purchased entity" field widget to "Product variation attributes (Stock-aware)"
 
 ### Optional: Customize Styling
 
@@ -146,3 +147,4 @@ services:
 ## License
 
 This module is licensed under the GPL-2.0-or-later license.
+
