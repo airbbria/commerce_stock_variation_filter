@@ -2,6 +2,9 @@
 
 A Drupal 10 Commerce module that extends the Add to Cart form to filter product variations based on stock availability.
 
+This is a working but sandbox module.
+I use it in one project with commece_simple_stock module and might give you ideas to create your own custom module for the same purpose.
+
 ## Features
 
 - **Smart Default Selection**: Automatically selects the first in-stock variation on initial page load
@@ -147,4 +150,5 @@ services:
 ## License
 
 This module is licensed under the GPL-2.0-or-later license.
+
 
